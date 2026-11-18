@@ -4,10 +4,12 @@ import Curves from './pages/Curves.jsx'
 import Contracts from './pages/Contracts.jsx'
 import Relations from './pages/Relations.jsx'
 import Publish from './pages/Publish.jsx'
+import Chain from './pages/Chain.jsx'
 
 const TABS = [
   ['batches', '发送批次'],
   ['curves', '批次曲线'],
+  ['chain', '链路缺口'],
   ['contracts', '协议契约'],
   ['relations', '关系与锚点'],
   ['publish', '发布与消费'],
@@ -31,6 +33,7 @@ export default function App() {
       <main>
         {tab === 'batches' && <Batches />}
         {tab === 'curves' && <Curves />}
+        {tab === 'chain' && <Chain />}
         {tab === 'contracts' && <Contracts />}
         {tab === 'relations' && <Relations />}
         {tab === 'publish' && <Publish />}

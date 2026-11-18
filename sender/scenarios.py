@@ -84,6 +84,60 @@ class Client:
     def get(self, path: str):
         return self._req("GET", path)
 
+    # ---- 观测链路 ----
+    def chain_import(self, payload: dict):
+        return self._req("POST", "/api/chain/import", payload)
+
+    def chain_manifest(self, payload: dict):
+        return self._req("POST", "/api/chain/manifests", payload)
+
+    def chain_refresh(self, scopes=None):
+        body = {"scopes": scopes} if scopes is not None else {}
+        return self._req("POST", "/api/chain/refresh", body)
+
+    @staticmethod
+    def _received(events: list):
+        ts = sorted(e["arrival_at"] for e in events if e.get("arrival_at"))
+        return ts[-1] if ts else None
+
+    def chain_ingest(self, device_id: str, boot_batch: str, events: list,
+                     source: str = "gateway_sync"):
+        """平台接入：真实入库并解析（source=ingest），不是补传。"""
+        return self._req("POST", "/api/chain/backfill", {
+            "device_id": device_id, "boot_batch": boot_batch,
+            "source": source, "events": events, "refresh": True,
+            "received_at": self._received(events), "source_kind": "ingest"})
+
+    def chain_backfill(self, device_id: str, boot_batch: str, events: list,
+                       source: str = "gateway_retry"):
+        return self._req("POST", "/api/chain/backfill", {
+            "device_id": device_id, "boot_batch": boot_batch,
+            "source": source, "events": events, "refresh": True,
+            "received_at": self._received(events)})
+
+    def chain_gaps(self, query: str = ""):
+        return self._req("GET", "/api/chain/gaps" + query)
+
+    def chain_gap(self, gap_id: int):
+        return self._req("GET", f"/api/chain/gaps/{gap_id}")
+
+    def chain_annotate(self, gap_id: int, operator: str, evidence: str,
+                       scope: str = "", cause: str | None = None):
+        return self._req("POST", f"/api/chain/gaps/{gap_id}/annotate",
+                         {"operator": operator, "evidence": evidence,
+                          "scope": scope, "cause": cause})
+
+    def chain_segments(self, query: str = ""):
+        return self._req("GET", "/api/chain/segments" + query)
+
+    def chain_coverage(self, cargo_batch_id: str):
+        return self._req("GET",
+                         f"/api/chain/coverage?cargo_batch_id={cargo_batch_id}")
+
+    def chain_events(self, device_id: str, boot_batch: str, query: str = ""):
+        return self._req(
+            "GET", f"/api/chain/events?device_id={device_id}&boot_batch={boot_batch}{query}")
+
 
 # ---------------------------------------------------------------- 场景
 

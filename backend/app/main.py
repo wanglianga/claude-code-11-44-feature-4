@@ -29,6 +29,13 @@ from .publish import (
 )
 from .replay import ReplayAbort, run_replay
 from .seed import seed as seed_data
+from . import chain as CH
+from .models import (
+    AffectedSegment, ChainConflict, ChainEvent, ChainGap, ChainGapVersion,
+    ChainManifest, ChainPacket, ChainScopeState, ChainRefresh,
+    ChainSegmentRevision, CollectionTask, DeviceSignal, PublicationCoverage,
+    SamplingPlan,
+)
 
 app = FastAPI(title="冷链批次温控信号数据服务", version="1.0.0")
 app.add_middleware(
@@ -301,7 +308,12 @@ def curves(cargo_batch_id: str | None = None, device_id: str | None = None,
             "vehicle_id": rv.vehicle_id, "cargo_batch_id": rv.cargo_batch_id,
             "quality_flag": rv.quality_flag,
         })
-    return {"series": series}
+    gaps = []
+    if cargo_batch_id:
+        from .config import settings as _s
+        cg = CH.chain_coverage_map(db, cargo_batch_id)
+        gaps = list(cg.values())
+    return {"series": series, "coverage": gaps}
 
 
 # ---------------------------------------------------------------- 契约与重放
@@ -409,8 +421,11 @@ def create_relation(body: RelationIn, db: Session = Depends(get_db)):
     r = DeviceRelation(**body.model_dump())
     db.add(r)
     bump_counter(db, "relation_revision")
+    db.flush()
+    CH.mark_relation_change(db, body.probe_id, "安装关系修订")
     db.commit()
-    return {"id": r.id, "relation_revision": get_counter(db, "relation_revision")}
+    return {"id": r.id, "relation_revision": get_counter(db, "relation_revision"),
+            "note": "相关观测区间已失效，需刷新诊断（结果在此之前标记滞后）"}
 
 
 class AnchorIn(BaseModel):
@@ -446,8 +461,10 @@ def build_pub(purpose: str, db: Session = Depends(get_db)):
         pub = build_publication(db, purpose)
     except PublishError as e:
         raise HTTPException(400, str(e))
+    coverage = CH.compute_publication_coverage(db, pub)
+    db.commit()
     return {"id": pub.id, "purpose": pub.purpose, "version": pub.version,
-            "item_count": pub.item_count}
+            "item_count": pub.item_count, "coverage": coverage}
 
 
 @app.get("/api/publications")
@@ -461,6 +478,24 @@ def list_pubs(purpose: str | None = None, db: Session = Depends(get_db)):
                               "status": p.status, "item_count": p.item_count,
                               "relation_revision": p.relation_revision,
                               "created_at": _iso(p.created_at)} for p in pubs]}
+
+
+@app.get("/api/publications/{pub_id}/coverage")
+def pub_coverage(pub_id: int, db: Session = Depends(get_db)):
+    pub = db.get(Publication, pub_id)
+    if not pub:
+        raise HTTPException(404, "发布版本不存在")
+    rows = (db.query(PublicationCoverage).filter_by(publication_id=pub_id)
+            .order_by(PublicationCoverage.cargo_batch_id, PublicationCoverage.box_id)
+            .all())
+    return {"publication": {"id": pub.id, "purpose": pub.purpose,
+                            "version": pub.version, "status": pub.status,
+                            "item_count": pub.item_count},
+            "coverage": [{"cargo_batch_id": r.cargo_batch_id, "box_id": r.box_id,
+                          "coverage": r.coverage, "open_gaps": r.open_gaps,
+                          "affected_segments": r.affected_segments,
+                          "diagnosis_snapshot": r.diagnosis_snapshot,
+                          "computed_at": _iso(r.computed_at)} for r in rows]}
 
 
 @app.get("/api/publications/{pub_id}/items")
@@ -545,6 +580,388 @@ def consumption_records(consumer_id: int | None = None, db: Session = Depends(ge
                          "from_seq": r.from_seq, "to_seq": r.to_seq,
                          "item_count": r.item_count,
                          "acked_at": _iso(r.acked_at)} for r in recs]}
+
+
+
+
+# ---------------------------------------------------------------- 观测链路诊断
+
+@app.post("/api/chain/import")
+def chain_import(payload: dict = Body(...), db: Session = Depends(get_db)):
+    """一次导入采样计划/采集任务/各环节清单（虚构或真实回执）。"""
+    try:
+        out = CH.load_bundle(db, payload)
+    except (KeyError, ValueError) as e:
+        raise HTTPException(400, f"清单导入失败：{e}")
+    return out
+
+
+@app.post("/api/chain/manifests")
+def chain_import_manifest(payload: dict = Body(...), db: Session = Depends(get_db)):
+    try:
+        m = CH.import_manifest(db, payload)
+    except (KeyError, ValueError) as e:
+        raise HTTPException(400, f"清单导入失败：{e}")
+    db.commit()
+    return {"manifest_id": m.id, "tier": m.tier, "device_id": m.device_id,
+            "boot_batch": m.boot_batch, "event_count": m.event_count}
+
+
+@app.get("/api/chain/manifests")
+def chain_list_manifests(device_id: str | None = None, boot_batch: str | None = None,
+                         tier: str | None = None, db: Session = Depends(get_db)):
+    q = db.query(ChainManifest)
+    if device_id:
+        q = q.filter_by(device_id=device_id)
+    if boot_batch:
+        q = q.filter_by(boot_batch=boot_batch)
+    if tier:
+        q = q.filter_by(tier=tier)
+    ms = q.order_by(ChainManifest.id).all()
+    return {"manifests": [{"id": m.id, "tier": m.tier,
+                           "tier_label": CH.TIER_LABELS.get(m.tier, m.tier),
+                           "device_id": m.device_id, "boot_batch": m.boot_batch,
+                           "seq_from": m.seq_from, "seq_to": m.seq_to,
+                           "complete": m.complete, "source": m.source,
+                           "source_ref": m.source_ref,
+                           "received_from": _iso(m.received_from),
+                           "received_to": _iso(m.received_to),
+                           "event_count": m.event_count, "note": m.note,
+                           "imported_at": _iso(m.imported_at)} for m in ms]}
+
+
+class PlanIn(BaseModel):
+    plan_key: str
+    version: int = 1
+    device_id: str | None = None
+    interval_s: float
+    anchor_time: datetime
+    anchor_seq: int = 0
+    drift_s_per_step: float = 0.0
+    effective_from: datetime | None = None
+    effective_to: datetime | None = None
+    note: str = ""
+
+
+@app.get("/api/chain/plans")
+def chain_plans(db: Session = Depends(get_db)):
+    ps = db.query(SamplingPlan).order_by(SamplingPlan.plan_key,
+                                         SamplingPlan.version).all()
+    return {"plans": [{"id": p.id, "plan_key": p.plan_key, "version": p.version,
+                       "device_id": p.device_id, "interval_s": p.interval_s,
+                       "anchor_time": _iso(p.anchor_time),
+                       "anchor_seq": p.anchor_seq,
+                       "drift_s_per_step": p.drift_s_per_step,
+                       "status": p.status, "note": p.note,
+                       "effective_from": _iso(p.effective_from),
+                       "effective_to": _iso(p.effective_to)} for p in ps]}
+
+
+@app.post("/api/chain/plans")
+def chain_create_plan(body: PlanIn, db: Session = Depends(get_db)):
+    p = CH.ensure_sampling_plan(
+        db, body.plan_key, body.version, body.device_id, body.interval_s,
+        body.anchor_time, body.anchor_seq, body.drift_s_per_step,
+        body.effective_from, body.effective_to, body.note)
+    if body.version > 1:
+        old = (db.query(SamplingPlan)
+               .filter(SamplingPlan.plan_key == body.plan_key,
+                       SamplingPlan.version < body.version).all())
+        for o in old:
+            o.status = "retired"
+    db.commit()
+    return {"id": p.id, "plan_key": p.plan_key, "version": p.version}
+
+
+class TaskIn(BaseModel):
+    task_key: str
+    device_id: str
+    boot_batch: str
+    plan_key: str
+    plan_version: int
+    expected_seq_from: int
+    expected_seq_to: int
+    cargo_batch_id: str | None = None
+    box_id: str | None = None
+    vehicle_id: str | None = None
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    note: str = ""
+
+
+@app.get("/api/chain/tasks")
+def chain_tasks(db: Session = Depends(get_db)):
+    ts = db.query(CollectionTask).order_by(CollectionTask.id).all()
+    out = []
+    for t in ts:
+        plan = db.get(SamplingPlan, t.plan_id)
+        out.append({"id": t.id, "task_key": t.task_key, "device_id": t.device_id,
+                    "boot_batch": t.boot_batch,
+                    "cargo_batch_id": t.cargo_batch_id, "box_id": t.box_id,
+                    "vehicle_id": t.vehicle_id,
+                    "plan_id": t.plan_id,
+                    "plan_key": plan.plan_key if plan else None,
+                    "plan_version": plan.version if plan else None,
+                    "expected_seq_from": t.expected_seq_from,
+                    "expected_seq_to": t.expected_seq_to,
+                    "window_start": _iso(t.window_start),
+                    "window_end": _iso(t.window_end), "status": t.status,
+                    "note": t.note})
+    return {"tasks": out}
+
+
+@app.post("/api/chain/tasks")
+def chain_create_task(body: TaskIn, db: Session = Depends(get_db)):
+    plan = (db.query(SamplingPlan)
+            .filter_by(plan_key=body.plan_key, version=body.plan_version).first())
+    if not plan:
+        raise HTTPException(404, "采样计划版本不存在")
+    t = CH.ensure_task(db, body.task_key, body.device_id, body.boot_batch, plan,
+                       body.expected_seq_from, body.expected_seq_to,
+                       body.cargo_batch_id, body.box_id, body.vehicle_id,
+                       body.window_start, body.window_end, body.note)
+    db.commit()
+    return {"id": t.id, "task_key": t.task_key}
+
+
+class RefreshIn(BaseModel):
+    scopes: list[dict] | None = None   # [{"device_id":..,"boot_batch":..}]
+    note: str = "手动刷新"
+
+
+@app.post("/api/chain/refresh")
+def chain_refresh(body: RefreshIn | None = None, db: Session = Depends(get_db)):
+    scopes = None
+    trig = "手动刷新"
+    if body:
+        trig = body.note or trig
+        if body.scopes is not None:
+            scopes = [(s["device_id"], str(s["boot_batch"])) for s in body.scopes]
+    refs = CH.refresh_scopes(db, scopes, trig)
+    return {"refreshes": [{"id": r.id, "scope_key": r.scope_key,
+                           "status": r.status, "tasks": r.tasks_evaluated,
+                           "gaps": r.gaps_evaluated,
+                           "created": r.gaps_created,
+                           "changed": r.gaps_changed,
+                           "filled": r.gaps_filled,
+                           "note": r.note,
+                           "finished_at": _iso(r.finished_at)} for r in refs]}
+
+
+@app.get("/api/chain/scopes")
+def chain_scopes(db: Session = Depends(get_db)):
+    sts = db.query(ChainScopeState).order_by(ChainScopeState.scope_key).all()
+    refs = {r.id: r for r in db.query(ChainRefresh)
+            .filter(ChainRefresh.id.in_([s.last_refresh_id for s in sts
+                                         if s.last_refresh_id])).all()} if sts else {}
+    out = []
+    for s in sts:
+        r = refs.get(s.last_refresh_id)
+        out.append({"scope_key": s.scope_key, "device_id": s.device_id,
+                    "boot_batch": s.boot_batch, "stale": s.stale,
+                    "stale_reason": s.stale_reason,
+                    "last_evaluated_at": _iso(s.last_evaluated_at),
+                    "last_refresh": ({"id": r.id, "status": r.status,
+                                      "note": r.note,
+                                      "finished_at": _iso(r.finished_at)}
+                                     if r else None)})
+    return {"scopes": out}
+
+
+@app.get("/api/chain/gaps")
+def chain_gaps(cargo_batch_id: str | None = None, device_id: str | None = None,
+               box_id: str | None = None, status: str | None = None,
+               cause: str | None = None, segment: str | None = None,
+               active_only: bool = False, include_closed: bool = False,
+               db: Session = Depends(get_db)):
+    q = db.query(ChainGap)
+    if cargo_batch_id:
+        q = q.filter(ChainGap.cargo_batch_id == cargo_batch_id)
+    if device_id:
+        q = q.filter(ChainGap.device_id == device_id)
+    if box_id:
+        q = q.filter(ChainGap.box_id == box_id)
+    if status:
+        q = q.filter(ChainGap.status == status)
+    if cause:
+        q = q.filter(ChainGap.cause == cause)
+    if segment:
+        q = q.filter(ChainGap.segment == segment)
+    # 默认只看当前（未关闭）缺口；历史判断在缺口详情里按版本展开
+    if active_only or not include_closed:
+        q = q.filter(ChainGap.active.is_(True))
+    gaps = q.order_by(ChainGap.device_id, ChainGap.seq_from, ChainGap.id).all()
+    return {"gaps": [CH.gap_dict(db, g) for g in gaps],
+            "segments": [{"key": k, "label": v} for k, v in
+                         CH.SEGMENT_LABELS.items()],
+            "causes": [{"key": k, "label": v} for k, v in
+                       CH.CAUSE_LABELS.items()]}
+
+
+@app.get("/api/chain/gaps/{gap_id}")
+def chain_gap_detail(gap_id: int, db: Session = Depends(get_db)):
+    g = db.get(ChainGap, gap_id)
+    if not g:
+        raise HTTPException(404, "缺口不存在")
+    d = CH.gap_dict(db, g)
+    d["versions"] = CH.versions_dict(db, gap_id)
+    return d
+
+
+@app.get("/api/chain/gaps/{gap_id}/versions")
+def chain_gap_versions(gap_id: int, db: Session = Depends(get_db)):
+    if not db.get(ChainGap, gap_id):
+        raise HTTPException(404, "缺口不存在")
+    return {"gap_id": gap_id, "versions": CH.versions_dict(db, gap_id)}
+
+
+class AnnotateIn(BaseModel):
+    operator: str
+    evidence: str
+    scope: str = ""
+    cause: str | None = None
+
+
+@app.post("/api/chain/gaps/{gap_id}/annotate")
+def chain_gap_annotate(gap_id: int, body: AnnotateIn, db: Session = Depends(get_db)):
+    g = db.get(ChainGap, gap_id)
+    if not g:
+        raise HTTPException(404, "缺口不存在")
+    try:
+        return CH.annotate_gap(db, g, body.operator, body.evidence,
+                               body.scope, body.cause)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/chain/events")
+def chain_events(device_id: str, boot_batch: str,
+                 seq_from: int | None = None, seq_to: int | None = None,
+                 tier: str | None = None, db: Session = Depends(get_db)):
+    return CH.events_dict(db, device_id, boot_batch, seq_from, seq_to, tier)
+
+
+@app.get("/api/chain/segments")
+def chain_segments(cargo_batch_id: str | None = None, box_id: str | None = None,
+                   device_id: str | None = None, active_only: bool = True,
+                   include_closed: bool = False,
+                   db: Session = Depends(get_db)):
+    q = db.query(AffectedSegment)
+    if cargo_batch_id:
+        q = q.filter(AffectedSegment.cargo_batch_id == cargo_batch_id)
+    if box_id:
+        q = q.filter(AffectedSegment.box_id == box_id)
+    if device_id:
+        q = q.filter(AffectedSegment.device_id == device_id)
+    segs = q.order_by(AffectedSegment.device_id, AffectedSegment.effective_from).all()
+    out = []
+    for s in segs:
+        gap = db.get(ChainGap, s.gap_id)
+        if active_only and not include_closed and (not gap or not gap.active):
+            continue
+        d = CH._segment_dict(s)
+        if gap:
+            d["gap_status"] = gap.status
+            d["gap_cause"] = gap.cause
+            d["gap_cause_label"] = CH.CAUSE_LABELS.get(gap.cause, gap.cause)
+            d["gap_version"] = gap.version
+        out.append(d)
+    return {"segments": out}
+
+
+@app.get("/api/chain/segments/{segment_id}/history")
+def chain_segment_history(segment_id: int, db: Session = Depends(get_db)):
+    s = db.get(AffectedSegment, segment_id)
+    if not s:
+        raise HTTPException(404, "区段不存在")
+    revs = (db.query(ChainSegmentRevision)
+            .filter_by(affected_segment_id=segment_id)
+            .order_by(ChainSegmentRevision.revision).all())
+    return {"segment": CH._segment_dict(s),
+            "history": [{"revision": r.revision, "coverage": r.coverage,
+                         "expected_count": r.expected_count,
+                         "observed_count": r.observed_count,
+                         "sample_ids": r.sample_ids,
+                         "readings_basis": r.readings_basis,
+                         "remaining_gap": r.remaining_gap,
+                         "change_reason": r.change_reason,
+                         "created_at": _iso(r.created_at)} for r in revs]}
+
+
+@app.get("/api/chain/conflicts")
+def chain_conflicts(status: str | None = None, db: Session = Depends(get_db)):
+    q = db.query(ChainConflict)
+    if status:
+        q = q.filter_by(status=status)
+    cs = q.order_by(ChainConflict.id).all()
+    return {"conflicts": [{"id": c.id, "device_id": c.device_id,
+                           "boot_batch": c.boot_batch, "sample_seq": c.sample_seq,
+                           "tier_a": c.tier_a, "tier_b": c.tier_b,
+                           "hash_a": c.hash_a, "hash_b": c.hash_b,
+                           "content_a": c.content_a, "content_b": c.content_b,
+                           "status": c.status,
+                           "detected_at": _iso(c.detected_at)} for c in cs]}
+
+
+@app.get("/api/chain/signals")
+def chain_signals(device_id: str | None = None, db: Session = Depends(get_db)):
+    q = db.query(DeviceSignal)
+    if device_id:
+        q = q.filter_by(device_id=device_id)
+    ss = q.order_by(DeviceSignal.at).all()
+    return {"signals": [{"id": s.id, "device_id": s.device_id,
+                         "boot_batch": s.boot_batch, "kind": s.kind,
+                         "at": _iso(s.at), "source": s.source,
+                         "note": s.note} for s in ss]}
+
+
+class BackfillIn(BaseModel):
+    device_id: str
+    boot_batch: str
+    source: str = "gateway_retry"
+    received_at: datetime | None = None
+    events: list[dict]
+    refresh: bool = True
+    source_kind: str = "backfill"    # backfill=迟到补传；ingest=平台正常接入
+
+
+@app.post("/api/chain/backfill")
+def chain_backfill(body: BackfillIn, db: Session = Depends(get_db)):
+    """补传迟到数据：入库、更新区段覆盖与批次曲线，仅重算受影响区间。"""
+    try:
+        out = CH.ingest_backfill(db, body.device_id, body.boot_batch,
+                                 body.events, body.source, body.received_at,
+                                 source_kind=body.source_kind)
+    except (KeyError, ValueError) as e:
+        raise HTTPException(400, f"补传失败：{e}")
+    refreshes = []
+    if body.refresh:
+        refreshes = CH.refresh_scopes(
+            db, [(body.device_id, str(body.boot_batch))], "补传后重算")
+    return {"backfill": out,
+            "refreshes": [{"id": r.id, "scope_key": r.scope_key,
+                           "status": r.status, "gaps": r.gaps_evaluated,
+                           "filled": r.gaps_filled} for r in refreshes]}
+
+
+@app.get("/api/chain/coverage")
+def chain_coverage(cargo_batch_id: str | None = None, db: Session = Depends(get_db)):
+    """批次/货箱的温控有效覆盖与剩余缺口（含曲线空档带）。"""
+    q = db.query(AffectedSegment)
+    if cargo_batch_id:
+        q = q.filter(AffectedSegment.cargo_batch_id == cargo_batch_id)
+    segs = q.order_by(AffectedSegment.effective_from).all()
+    out = []
+    for s in segs:
+        gap = db.get(ChainGap, s.gap_id)
+        if not gap or not gap.active:
+            continue
+        d = CH._segment_dict(s)
+        d["gap_status"], d["gap_cause"] = gap.status, gap.cause
+        d["gap_cause_label"] = CH.CAUSE_LABELS.get(gap.cause, gap.cause)
+        d["segment_label"] = CH.SEGMENT_LABELS.get(gap.segment, gap.segment)
+        out.append(d)
+    return {"coverage": out}
 
 
 # ---------------------------------------------------------------- 总览

@@ -201,3 +201,110 @@ python sender.py run all                # 以上全部按序执行
 python sender.py publish                # 构建两个用途的发布版本
 python sender.py consume audit-app batch_audit  # 模拟消费端按游标读完整版本
 ```
+
+---
+
+## 6. 观测链路缺口诊断
+
+曲线空档不直接等于“设备离线”。本服务把空档沿 **设备生成 → 网关接收 → 平台入库 → 平台解析**
+逐段核对，只确认证据支持的缺失环节。
+
+### 6.1 证据层与清单完整性
+
+| 层（tier） | 含义 | 能否逐序号判定 |
+| --- | --- | --- |
+| `device_generated` | 设备侧生成清单（计划内确实生成的样本） | 需 `complete` 且逐条列出事件 |
+| `gateway_received` | 网关接收清单（收到的包与事件） | 同上 |
+| `platform_received` | 平台已持久保存原文的事件 | 由解析记录/入库回执确定 |
+| `platform_parsed` | 平台已解析、可用于温控结果的事件 | 由 `parsed_message` 状态确定 |
+
+清单完整性始终限定到 **(设备, 启动批次, 明确序号范围)**：
+一条网关“本次同步成功”不能代替所有设备的完整性；只声明范围、未逐条列出事件的清单
+只能证明范围，不能逐序号判定缺件。
+
+### 6.2 统一事件身份与包/事件对应
+
+先统一事件身份 `(设备, 启动批次, 序号)` 并记录内容摘要，再比较各环节**已确认范围内的事件集合**，
+不比较传输包数量：网关可能把多次发送合成一包，也可能把同一包拆成多次转发；
+重试包只是同一组事件的到达记录，不新增采样。同身份内容不一致时保留冲突并显示两侧内容；
+缺号被相同数量的重复事件补足也不能判为完整。乱序到达不覆盖事件时间较新的状态。
+
+### 6.3 原因判定顺序
+
+1. 同身份内容冲突 → `pending_content_conflict`（待核）
+2. 平台已解析 → 不算缺口；平台已保存原文未解析 → `platform_parse_backlog`（不计链路丢失）
+3. 重启/序号复位信号或已知清单整体越界 → `pending_sequence_reset`（待核）
+4. 设备信号：单一已确认来源（计划停用/维护/断网）分别保留；多来源并立 → 待核；
+   缺心跳只记 `heartbeat_evidence_missing`，不证明采集中断
+5. 设备侧完整生成清单缺号 → `device_not_generated`（确认）
+6. 设备已生成、网关完整接收清单缺记录 → `device_to_gateway_loss`（确认）
+7. 设备与网关都记录成功、平台完整范围内缺件 → `gateway_to_platform_loss`（确认）
+8. 单有平台序号断档（上游无逐条事件可比）→ `platform_missing_only`（仅确认平台缺）
+9. 序号连续、平台其余入库时间集中变晚 → `platform_transport_late_candidate`
+10. 来源清单不完整 → `pending_scope_incomplete`；其余 → `pending_insufficient_evidence`
+
+每个缺口保留：货箱/设备/采集任务/预期采样计划版本、设备侧生成清单、网关接收清单、
+上次设备序号、设备事件时间、网关收到时间、平台接收时间、来源范围完整性、重复标识
+与原始记录引用；以及起止边界、状态、判断依据、仍未知环节和最近评估时间。
+
+### 6.4 增量维护与查询
+
+结果按 `(设备, 启动批次)` 区间增量维护。清单补齐、计划更正或设备换绑使相关区间失效，
+重算完成前接口明确标记**结果滞后**。两种读取方式：
+
+- 查询时关联计划/设备/网关/平台清单计算缺口：适合低频抽查，资料修订后立即使用新依据；
+- 持续维护区间缺口结果：仪表盘与批量影响查询更快，但每次证据修订都要失效并重算。
+
+本实现采用第二种，并保留每次判断的不可变版本（`chain_gap_version` + 证据记录）。
+重算范围由来源批次及有效安装关系确定——一次网关恢复可补回多个设备的数据，
+不会只因最后上传的货箱而重开无关货箱。
+
+### 6.5 下游温控区段
+
+缺口按设备、有效安装关系与有效时段连接温控区段，计算应观测/已观测序号数与剩余缺口：
+
+- 未解析期间不补造温度、不推断为正常；
+- 迟到数据进入样本与读数（`reading_version.source = backfill`），
+  更新区段有效采样覆盖与批次曲线，并保留变化前后的读数依据；
+- 晚到数据不能覆盖整个范围时保留剩余缺口（状态 `partial`）；
+- 已发布报表引用发布当时的覆盖结论快照；只更新设备状态不会让已发布报表自动转为完整。
+
+人工标注记录操作者、证据与适用范围；后续证据冲突重开会重开诊断并保留此前判断版本，
+不静默改写已查看的告警。
+
+### 6.6 发送器与虚构清单
+
+```bash
+python sender.py chain all --export docs/samples   # 导出可导入的虚构清单（已随仓库提供）
+python sender.py chain gateway-platform-loss       # 独立演练：重置→导入→接入→诊断
+python sender.py chain baseline --import-file docs/samples/platform-late.json
+python sender.py backfill shared-gateway-backfill  # 补传迟到数据并重算受影响区段
+python sender.py gaps --batch LOT-C --active
+```
+
+清单 JSON 结构：
+
+```jsonc
+{
+  "relations": [{"probe_id": "...", "vehicle_id": "...", "box_id": "...",
+                 "cargo_batch_id": "...", "valid_from": "...", "valid_to": null}],
+  "plans": [{"plan_key": "plan-2002", "version": 1, "interval_s": 30,
+             "anchor_time": "...", "anchor_seq": 1000}],
+  "tasks": [{"task_key": "...", "device_id": "...", "boot_batch": "1",
+             "plan_key": "plan-2002", "plan_version": 1,
+             "expected_seq_from": 1000, "expected_seq_to": 1059}],
+  "manifests": [{
+    "tier": "gateway_received", "device_id": "...", "boot_batch": "1",
+    "seq_from": 1000, "seq_to": 1059, "complete": true,
+    "source": "gateway", "source_ref": "GW-MF-100",
+    "received_from": "...", "received_to": "...",
+    "events": [{"seq": 1000, "event_id": "GW-1000",
+                "event_time": "...", "content": {"std_c": 4.6},
+                "via": ["PKT-1"]}],
+    "packets": [{"packet_ref": "PKT-1", "device_ids": ["PRB-2002"],
+                 "event_count": 60, "received_at": "...", "retry": false,
+                 "split_of": null}],
+    "signals": [{"kind": "reboot", "at": "...", "source": "gateway"}]
+  }]
+}
+```

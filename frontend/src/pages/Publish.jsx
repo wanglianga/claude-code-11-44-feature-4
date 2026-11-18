@@ -10,6 +10,7 @@ export default function Publish() {
   const [msg, setMsg] = useState('')
   const [error, setError] = useState('')
   const [newConsumer, setNewConsumer] = useState({ name: 'audit-app', purpose: 'batch_audit' })
+  const [coverage, setCoverage] = useState(null)
 
   const load = () => {
     api.get('/api/publications').then((d) => { setPubs(d.publications); setPurposes(d.purposes) })
@@ -25,7 +26,16 @@ export default function Publish() {
   }
   const build = (purpose) => run(
     () => api.post(`/api/publications/build?purpose=${purpose}`),
-    (r) => `已发布 ${r.purpose} v${r.version}：${r.item_count} 条`)
+    (r) => {
+      setCoverage({ purpose: r.purpose, version: r.version, rows: r.coverage || [] })
+      return `已发布 ${r.purpose} v${r.version}：${r.item_count} 条`
+    })
+  const showCoverage = async (pubId, purpose, version) => {
+    try {
+      const d = await api.get(`/api/publications/${pubId}/coverage`)
+      setCoverage({ purpose, version, rows: d.coverage })
+    } catch (e) { setError(e.message) }
+  }
   const createConsumer = () => run(
     () => api.post('/api/consumers', newConsumer),
     (r) => `消费端 #${r.id}（${r.name}/${r.purpose}）就绪`)
@@ -54,17 +64,43 @@ export default function Publish() {
         ))}
       </div>
       <table>
-        <thead><tr><th>用途</th><th>版本</th><th>状态</th><th>条数</th><th>关系版本</th><th>发布时间</th></tr></thead>
+        <thead><tr><th>用途</th><th>版本</th><th>状态</th><th>条数</th><th>关系版本</th><th>发布时间</th><th></th></tr></thead>
         <tbody>
           {pubs.map((p) => (
             <tr key={p.id}>
               <td>{p.purpose}</td><td>v{p.version}</td>
               <td><span className={p.status === 'current' ? 'tag ok' : 'tag'}>{p.status}</span></td>
               <td>{p.item_count}</td><td>{p.relation_revision}</td><td>{p.created_at}</td>
+              <td><button onClick={() => showCoverage(p.id, p.purpose, p.version)}>覆盖结论</button></td>
             </tr>
           ))}
         </tbody>
       </table>
+
+      {coverage && (
+        <div className="panel">
+          <h4>发布覆盖结论 · {coverage.purpose} v{coverage.version}
+            <span className="muted">（引用发布当时的诊断覆盖，后续设备状态变化不会自动改写）</span>
+          </h4>
+          <table>
+            <thead><tr><th>货物批次</th><th>货箱</th><th>覆盖</th><th>关联缺口</th>
+              <th>受影响区段</th></tr></thead>
+            <tbody>
+              {coverage.rows.map((r, i) => (
+                <tr key={i}>
+                  <td>{r.cargo_batch_id || '—'}</td><td>{r.box_id || '—'}</td>
+                  <td><span className={r.coverage === 'complete' ? 'tag ok'
+                    : r.coverage === 'uncovered' ? 'tag bad' : 'tag warn'}>
+                    {r.coverage}</span></td>
+                  <td>{(r.open_gaps || []).join(', ') || '—'}</td>
+                  <td className="note">{(r.affected_segments || []).map((s) =>
+                    `#${s.segment_id} ${s.coverage}`).join('; ') || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       <h2>模拟消费端</h2>
       <div className="form">

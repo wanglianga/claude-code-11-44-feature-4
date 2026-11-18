@@ -13,6 +13,8 @@ class Settings:
     # 标准温度的物理合理区间（校验用，超出标记 out_of_range，不丢弃、不静默通过）
     VALID_TEMP_MIN_C: float = float(os.getenv("VALID_TEMP_MIN_C", "-60"))
     VALID_TEMP_MAX_C: float = float(os.getenv("VALID_TEMP_MAX_C", "100"))
+    # 观测链路：平台入库时间相对预期采样时间晚于该阈值，视为“迟到候选”
+    CHAIN_LATE_THRESHOLD_S: float = float(os.getenv("CHAIN_LATE_THRESHOLD_S", "600"))
 
 
 settings = Settings()

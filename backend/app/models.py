@@ -7,6 +7,10 @@
   标准化层    parsed_message / sample / sample_conflict / reading_version / current_reading
   质量发布层  publication / publication_item / consumer / consumption_record
   运行控制    standard_run（标准化/重放运行，提交前校验）
+  观测链路层  sampling_plan / collection_task / chain_manifest / chain_event / chain_packet
+              chain_arrival / device_signal / chain_conflict / chain_gap / chain_gap_version
+              chain_gap_evidence / affected_segment / chain_segment_revision
+              chain_refresh / chain_scope_state / publication_coverage
 """
 from sqlalchemy import (
     BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer,
@@ -308,3 +312,366 @@ class ConsumptionRecord(Base):
     to_seq = Column(Integer, nullable=False)
     item_count = Column(Integer, nullable=False)
     acked_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---------------------------------------------------------------- 观测链路层
+#
+# 证据分层（tier）：
+#   device_generated  设备侧生成清单（计划内确实生成的样本）
+#   gateway_received  网关接收清单（收到的包与事件）
+#   platform_received 平台入库清单（已持久保存原文的事件）
+#   platform_parsed   平台解析清单（可被温控结果使用的事件）
+# 清单完整性始终限定到 (设备, 启动批次, 明确序号范围)；
+# 一条网关“本次同步成功”不能代替所有设备的完整性。
+
+
+class SamplingPlan(Base):
+    """预期采样规则版本。设备更换计划即新增版本，旧版本保持可追溯。"""
+    __tablename__ = "sampling_plan"
+    __table_args__ = (UniqueConstraint("plan_key", "version", name="uq_plan_key_version"),)
+
+    id = Column(Integer, primary_key=True)
+    plan_key = Column(String(64), nullable=False)
+    version = Column(Integer, nullable=False)
+    device_id = Column(String(64))
+    interval_s = Column(Float, nullable=False)
+    drift_s_per_step = Column(Float, nullable=False, default=0.0)
+    anchor_time = Column(DateTime(timezone=True), nullable=False)
+    anchor_seq = Column(BigInteger, nullable=False, default=0)
+    status = Column(String(16), nullable=False, default="active")  # active | retired
+    effective_from = Column(DateTime(timezone=True))
+    effective_to = Column(DateTime(timezone=True))
+    definition = Column(JSONB, default=dict)
+    note = Column(String(256), default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CollectionTask(Base):
+    """采集任务：设备某启动批次在一段有效期内按某一采样计划采集。"""
+    __tablename__ = "collection_task"
+
+    id = Column(Integer, primary_key=True)
+    task_key = Column(String(64), unique=True, nullable=False)
+    device_id = Column(String(64), nullable=False)
+    boot_batch = Column(String(64), nullable=False)
+    cargo_batch_id = Column(String(64))
+    box_id = Column(String(64))
+    vehicle_id = Column(String(64))
+    plan_id = Column(Integer, ForeignKey("sampling_plan.id"), nullable=False)
+    expected_seq_from = Column(BigInteger, nullable=False)
+    expected_seq_to = Column(BigInteger, nullable=False)
+    window_start = Column(DateTime(timezone=True))
+    window_end = Column(DateTime(timezone=True))
+    status = Column(String(16), nullable=False, default="active")  # active | closed
+    note = Column(String(256), default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ChainManifest(Base):
+    """某一环节的已确认清单（导入的虚构或真实回执）。
+
+    完整性限定到单设备 + 启动批次 + 序号范围。complete=True 表示该范围内
+    该环节“已确认完整”，范围外不推断。
+    """
+    __tablename__ = "chain_manifest"
+
+    id = Column(Integer, primary_key=True)
+    tier = Column(String(24), nullable=False)             # device_generated|gateway_received|platform_received|platform_parsed
+    device_id = Column(String(64), nullable=False)
+    boot_batch = Column(String(64), nullable=False)
+    seq_from = Column(BigInteger, nullable=False)
+    seq_to = Column(BigInteger, nullable=False)
+    complete = Column(Boolean, nullable=False, default=False)
+    source = Column(String(128), default="")
+    source_ref = Column(String(128), default="")
+    declared_event_from = Column(DateTime(timezone=True))
+    declared_event_to = Column(DateTime(timezone=True))
+    received_from = Column(DateTime(timezone=True))
+    received_to = Column(DateTime(timezone=True))
+    event_count = Column(Integer, nullable=False, default=0)
+    manifest_hash = Column(String(64), default="")
+    note = Column(String(256), default="")
+    raw = Column(JSONB, default=dict)
+    imported_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ChainEvent(Base):
+    """统一事件身份：(层, 设备, 启动批次, 序号) + 内容摘要。
+
+    同身份不同内容各保留一行并记冲突；重复投递只增加到达次数与到达记录。
+    乱序到达不覆盖事件时间较新的状态。
+    """
+    __tablename__ = "chain_event"
+    __table_args__ = (UniqueConstraint("tier", "device_id", "boot_batch", "sample_seq",
+                                       "content_hash", name="uq_chain_event_identity"),)
+
+    id = Column(BigInteger, primary_key=True)
+    tier = Column(String(24), nullable=False)
+    device_id = Column(String(64), nullable=False)
+    boot_batch = Column(String(64), nullable=False)
+    sample_seq = Column(BigInteger, nullable=False)
+    event_id = Column(String(128))                        # 首个来源事件标识（按来源保留）
+    event_ids = Column(JSONB, default=list)               # 同一身份出现过的全部来源事件标识
+    content_hash = Column(String(64), nullable=False)
+    content = Column(JSONB, nullable=False)               # 该层保留的原始内容（含温度）
+    event_time = Column(DateTime(timezone=True))          # 事件时间；乱序到达不覆盖较新值
+    first_manifest_id = Column(Integer, ForeignKey("chain_manifest.id"), nullable=False)
+    arrival_count = Column(Integer, nullable=False, default=1)
+    first_seen_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_arrival_at = Column(DateTime(timezone=True))
+
+
+class ChainPacket(Base):
+    """包与事件的对应：网关可合并多个设备的发送，也可把同一包拆成多次转发。
+
+    重试包是同一组事件的到达记录，不新增采样。
+    """
+    __tablename__ = "chain_packet"
+
+    id = Column(BigInteger, primary_key=True)
+    manifest_id = Column(Integer, ForeignKey("chain_manifest.id"), nullable=False)
+    tier = Column(String(24), nullable=False)
+    packet_ref = Column(String(128), nullable=False)
+    device_ids = Column(JSONB, default=list)
+    event_count = Column(Integer, nullable=False, default=0)
+    content_digest = Column(String(64), default="")
+    received_at = Column(DateTime(timezone=True))
+    retry = Column(Boolean, nullable=False, default=False)
+    split_of = Column(String(128))
+    note = Column(String(256), default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ChainArrival(Base):
+    """事件的每一次到达（包 × 事件）。重复投递可展开到原始到达次数。"""
+    __tablename__ = "chain_arrival"
+    __table_args__ = (UniqueConstraint("event_id", "packet_id", name="uq_arrival_event_packet"),)
+
+    id = Column(BigInteger, primary_key=True)
+    event_id = Column(BigInteger, ForeignKey("chain_event.id"), nullable=False)
+    packet_id = Column(BigInteger, ForeignKey("chain_packet.id"), nullable=False)
+    received_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class DeviceSignal(Base):
+    """设备侧信号：心跳、计划停用、运输途中断网、已确认维护、重启。
+
+    每类来源单独保留；缺少心跳只表示缺少心跳证据，不能证明温度采集停止。
+    """
+    __tablename__ = "device_signal"
+
+    id = Column(BigInteger, primary_key=True)
+    device_id = Column(String(64), nullable=False)
+    boot_batch = Column(String(64))
+    kind = Column(String(32), nullable=False)  # heartbeat|planned_stop|maintenance|network_outage|reboot|decommission
+    at = Column(DateTime(timezone=True), nullable=False)
+    source = Column(String(128), default="")
+    note = Column(String(256), default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ChainConflict(Base):
+    """同身份内容不一致：显示具体冲突，不静默采用任一值。"""
+    __tablename__ = "chain_conflict"
+
+    id = Column(BigInteger, primary_key=True)
+    device_id = Column(String(64), nullable=False)
+    boot_batch = Column(String(64), nullable=False)
+    sample_seq = Column(BigInteger, nullable=False)
+    tier_a = Column(String(24), nullable=False)
+    tier_b = Column(String(24), nullable=False)
+    hash_a = Column(String(64), nullable=False)
+    hash_b = Column(String(64), nullable=False)
+    content_a = Column(JSONB)
+    content_b = Column(JSONB)
+    manifest_a_id = Column(Integer)
+    manifest_b_id = Column(Integer)
+    status = Column(String(16), nullable=False, default="open")  # open | resolved
+    detected_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ChainGap(Base):
+    """缺口（当前状态）。每次判断的完整快照在 chain_gap_version。"""
+    __tablename__ = "chain_gap"
+
+    id = Column(Integer, primary_key=True)
+    gap_key = Column(String(128), unique=True, nullable=False)
+    device_id = Column(String(64), nullable=False)
+    boot_batch = Column(String(64), nullable=False)
+    cargo_batch_id = Column(String(64))
+    box_id = Column(String(64))
+    vehicle_id = Column(String(64))
+    collection_task_id = Column(Integer, ForeignKey("collection_task.id"))
+    plan_id = Column(Integer, ForeignKey("sampling_plan.id"))
+    plan_version = Column(Integer)
+    segment = Column(String(32), nullable=False)          # device|device_to_gateway|gateway_to_platform|platform|transport_or_platform|platform_parse|unknown
+    cause = Column(String(48), nullable=False)            # 见 chain.CAUSE_LABELS
+    status = Column(String(24), nullable=False)           # confirmed|pending|parse_backlog|annotated|filled|superseded
+    confidence = Column(String(16), nullable=False, default="low")
+    seq_from = Column(BigInteger, nullable=False)          # 当前剩余缺口边界
+    seq_to = Column(BigInteger, nullable=False)
+    origin_seq_from = Column(BigInteger)                   # 缺口首次识别的完整范围
+    origin_seq_to = Column(BigInteger)
+    time_from = Column(DateTime(timezone=True))
+    time_to = Column(DateTime(timezone=True))
+    last_device_seq = Column(BigInteger)
+    device_event_time = Column(DateTime(timezone=True))
+    gateway_received_time = Column(DateTime(timezone=True))
+    platform_received_time = Column(DateTime(timezone=True))
+    device_seq_continuous = Column(Boolean)
+    rationale = Column(Text, default="")
+    supporting = Column(JSONB, default=list)
+    conflicting = Column(JSONB, default=list)
+    unknown_segments = Column(JSONB, default=list)
+    scope_completeness = Column(JSONB, default=dict)
+    source_manifest_refs = Column(JSONB, default=list)
+    duplicate_counts = Column(JSONB, default=dict)
+    raw_refs = Column(JSONB, default=list)
+    annotation_operator = Column(String(64))
+    annotation_evidence = Column(Text)
+    annotation_scope = Column(String(256))
+    annotation_at = Column(DateTime(timezone=True))
+    annotation_cause = Column(String(48))
+    version = Column(Integer, nullable=False, default=1)
+    active = Column(Boolean, nullable=False, default=True)
+    stale = Column(Boolean, nullable=False, default=False)
+    reopened = Column(Boolean, nullable=False, default=False)
+    last_evaluated_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    closed_at = Column(DateTime(timezone=True))
+
+
+class ChainGapVersion(Base):
+    """不可变的判断版本：补传、标注、冲突重开后都新增版本，保留历史。"""
+    __tablename__ = "chain_gap_version"
+    __table_args__ = (UniqueConstraint("gap_id", "version", name="uq_gap_version"),)
+
+    id = Column(BigInteger, primary_key=True)
+    gap_id = Column(Integer, ForeignKey("chain_gap.id"), nullable=False)
+    version = Column(Integer, nullable=False)
+    status = Column(String(24), nullable=False)
+    cause = Column(String(48), nullable=False)
+    segment = Column(String(32), nullable=False)
+    seq_from = Column(BigInteger, nullable=False)
+    seq_to = Column(BigInteger, nullable=False)
+    time_from = Column(DateTime(timezone=True))
+    time_to = Column(DateTime(timezone=True))
+    confidence = Column(String(16), nullable=False)
+    rationale = Column(Text, default="")
+    unknowns = Column(JSONB, default=list)
+    scope_completeness = Column(JSONB, default=dict)
+    annotation = Column(JSONB)
+    change_reason = Column(String(128), nullable=False)
+    triggered_by = Column(String(128), default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ChainGapEvidence(Base):
+    """判断版本的可展开支持/冲突记录。"""
+    __tablename__ = "chain_gap_evidence"
+
+    id = Column(BigInteger, primary_key=True)
+    gap_version_id = Column(BigInteger, ForeignKey("chain_gap_version.id"), nullable=False)
+    role = Column(String(16), nullable=False)             # support | conflict
+    kind = Column(String(32), nullable=False)             # manifest|event|packet|signal|conflict|plan|relation
+    ref_id = Column(String(64))
+    summary = Column(String(512), nullable=False)
+    detail = Column(JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AffectedSegment(Base):
+    """缺口与温控区段的连接：按设备 + 有效安装关系 + 缺口有效时段计算。"""
+    __tablename__ = "affected_segment"
+    __table_args__ = (UniqueConstraint("gap_id", "relation_id", name="uq_seg_gap_relation"),)
+
+    id = Column(Integer, primary_key=True)
+    gap_id = Column(Integer, ForeignKey("chain_gap.id"), nullable=False)
+    relation_id = Column(Integer, ForeignKey("device_relation.id"))
+    device_id = Column(String(64), nullable=False)
+    vehicle_id = Column(String(64))
+    box_id = Column(String(64))
+    cargo_batch_id = Column(String(64))
+    effective_from = Column(DateTime(timezone=True))
+    effective_to = Column(DateTime(timezone=True))
+    coverage = Column(String(16), nullable=False, default="uncovered")  # uncovered|partial|covered
+    expected_count = Column(Integer, nullable=False, default=0)
+    observed_count = Column(Integer, nullable=False, default=0)
+    sample_ids = Column(JSONB, default=list)
+    readings_basis = Column(JSONB, default=list)
+    remaining_gap = Column(JSONB)
+    revision = Column(Integer, nullable=False, default=1)
+    stale = Column(Boolean, nullable=False, default=False)
+    last_recomputed = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ChainSegmentRevision(Base):
+    """区段覆盖变化历史（迟到数据补上/仍缺一部分），含前后读数依据。"""
+    __tablename__ = "chain_segment_revision"
+    __table_args__ = (UniqueConstraint("affected_segment_id", "revision", name="uq_seg_revision"),)
+
+    id = Column(BigInteger, primary_key=True)
+    affected_segment_id = Column(Integer, ForeignKey("affected_segment.id"), nullable=False)
+    revision = Column(Integer, nullable=False)
+    coverage = Column(String(16), nullable=False)
+    expected_count = Column(Integer, nullable=False)
+    observed_count = Column(Integer, nullable=False)
+    sample_ids = Column(JSONB, default=list)
+    readings_basis = Column(JSONB, default=list)
+    remaining_gap = Column(JSONB)
+    change_reason = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ChainScopeState(Base):
+    """增量维护的区间粒度：device|boot_batch。清单/计划/关系变化即失效。"""
+    __tablename__ = "chain_scope_state"
+
+    id = Column(Integer, primary_key=True)
+    scope_key = Column(String(128), unique=True, nullable=False)
+    device_id = Column(String(64), nullable=False)
+    boot_batch = Column(String(64), nullable=False)
+    stale = Column(Boolean, nullable=False, default=True)
+    stale_reason = Column(String(256), default="")
+    last_refresh_id = Column(Integer, ForeignKey("chain_refresh.id"))
+    last_evaluated_at = Column(DateTime(timezone=True))
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ChainRefresh(Base):
+    """一次区间重算。未完成或失效时接口明确标出结果滞后。"""
+    __tablename__ = "chain_refresh"
+
+    id = Column(Integer, primary_key=True)
+    scope_key = Column(String(128), nullable=False)
+    triggered_by = Column(String(128), default="")
+    status = Column(String(16), nullable=False, default="running")  # running|completed|failed
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    finished_at = Column(DateTime(timezone=True))
+    tasks_evaluated = Column(Integer, nullable=False, default=0)
+    gaps_evaluated = Column(Integer, nullable=False, default=0)
+    gaps_created = Column(Integer, nullable=False, default=0)
+    gaps_changed = Column(Integer, nullable=False, default=0)
+    gaps_filled = Column(Integer, nullable=False, default=0)
+    segments_recomputed = Column(Integer, nullable=False, default=0)
+    note = Column(String(256), default="")
+
+
+class PublicationCoverage(Base):
+    """发布版本的覆盖结论快照。后续设备状态变化不会自动改写已发布报表。"""
+    __tablename__ = "publication_coverage"
+    __table_args__ = (UniqueConstraint("publication_id", "cargo_batch_id", "box_id",
+                                       name="uq_pub_coverage_batch_box"),)
+
+    id = Column(Integer, primary_key=True)
+    publication_id = Column(Integer, ForeignKey("publication.id"), nullable=False)
+    cargo_batch_id = Column(String(64))
+    box_id = Column(String(64))
+    coverage = Column(String(24), nullable=False)          # complete|has_gaps|uncovered|unknown
+    open_gaps = Column(JSONB, default=list)
+    affected_segments = Column(JSONB, default=list)
+    diagnosis_snapshot = Column(JSONB, default=dict)
+    computed_at = Column(DateTime(timezone=True), server_default=func.now())
